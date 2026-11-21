@@ -30,6 +30,8 @@ class Store:
     def overview(self) -> dict[str, object]:
         modules: list[dict[str, object]] = []
         for name in self.module_names():
+            if name not in SEED_ROWS:
+                continue  # 窗口日历等内部表不计入业务模块看板
             rows = self.rows(name)
             modules.append({
                 "name": name,

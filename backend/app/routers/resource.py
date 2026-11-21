@@ -83,7 +83,7 @@ def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResu
     return ActionResult(ok=entry is not None, message=message, entry=entry)
 
 
-# -- 8 条跨模块管道 API --
+# -- 跨模块管道 API --
 
 from app.services.source_registry import SourceRegistryService
 from app.services.query_federation import QueryFederationService
@@ -221,3 +221,52 @@ def pipeline_cost_aggregate_alert() -> dict[str, Any]:
             "cost_aggregation": cost_svc.aggregate_module_costs(),
             "quota_check": cost_svc.check_monthly_quota(),
             "cache_report": result_cache_svc.cache_hit_rate_report()}
+
+
+# -- 时序窗口 → 定时计算 的日历交接管道 --
+
+from app.services.time_window import TimeWindowService
+from app.services.schedule_job import ScheduleJobService
+
+time_window_svc = TimeWindowService()
+schedule_svc = ScheduleJobService()
+
+
+@router.post("/pipelines/window-calendar-export")
+def pipeline_window_calendar_export(
+    window_id: int = Query(...), job_id: int = Query(...),
+    start_date: str | None = Query(default=None),
+    count: int = Query(default=24, ge=1, le=500),
+    align: str | None = Query(default=None),
+) -> dict[str, Any]:
+    """用时序窗口配置和定时任务时区导出计算日历；重复提交只保留一份日历安排。"""
+    result = time_window_svc.export_computation_calendar(
+        window_id, job_id, start_date=start_date, count=count, align=align)
+    if not result["ok"]:
+        raise HTTPException(status_code=400, detail=result["message"])
+    return {"ok": True, "pipeline": "window_calendar_export", **result}
+
+
+@router.get("/pipelines/window-calendar/download")
+def pipeline_window_calendar_download(schedule_id: int = Query(...)) -> StreamingResponse:
+    """下载可交接的窗口日历文件：重复本地小时分行区分，缺失时段不留 UTC 区间。"""
+    csv_text = time_window_svc.calendar_csv(schedule_id)
+    if csv_text is None:
+        raise HTTPException(status_code=404, detail=f"窗口日历 {schedule_id} 不存在")
+    return StreamingResponse(
+        iter([csv_text]), media_type="text/csv; charset=utf-8",
+        headers={"Content-Disposition": f'attachment; filename="window_calendar_{schedule_id}.csv"'})
+
+
+@router.post("/pipelines/schedule-claim-run")
+def pipeline_schedule_claim_run(
+    job_id: int = Query(...), schedule_id: int = Query(default=0),
+    claim_count: int = Query(default=1, ge=1, le=500),
+    run_batches: bool = Query(default=True),
+) -> dict[str, Any]:
+    """定时计算读入窗口日历确定执行起点，领取同步日历清单，调度器按时段写实际计算批。"""
+    claim = schedule_svc.claim_from_calendar(job_id, schedule_id or None, claim_count)
+    if not claim["ok"]:
+        raise HTTPException(status_code=400, detail=claim["message"])
+    run = schedule_svc.run_claimed_batches(job_id) if run_batches else None
+    return {"ok": True, "pipeline": "schedule_claim_run", "claim": claim, "run": run}
